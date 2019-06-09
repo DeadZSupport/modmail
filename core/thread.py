@@ -657,7 +657,7 @@ class ThreadManager:
 
         try:
             thread = self.cache[recipient_id]
-            if not self.bot.get_channel(thread.channel.id):  # deleted channel
+            if not thread.channel or not self.bot.get_channel(thread.channel.id):
                 self.bot.loop.create_task(
                     thread.close(
                         closer=self.bot.user, silent=True, delete_channel=False
@@ -739,13 +739,13 @@ class ThreadManager:
         """Sanitises a username for use with text channel names"""
         name = author.name.lower()
         new_name = (
-            "".join(l for l in name if l not in string.punctuation and l.printable())
+            "".join(l for l in name if l not in string.punctuation and l.isprintable())
             or "null"
         )
-        new_name += f"⧫{author.discriminator}"
+        new_name += f"-{author.discriminator}"
 
         while new_name in [c.name for c in self.bot.modmail_guild.text_channels]:
-            new_name += "⧫x"  # two channels with same name
+            new_name += "-x"  # two channels with same name
 
         return new_name
 
