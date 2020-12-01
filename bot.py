@@ -1,4 +1,4 @@
-__version__ = "3.7.0"
+__version__ = "3.7.13"
 
 
 import asyncio
@@ -38,6 +38,7 @@ from core.config import ConfigManager
 from core.models import (
     DMDisabled,
     HostingMethod,
+    InvalidConfigError,
     PermissionLevel,
     SafeFormatter,
     configure_logging,
@@ -119,6 +120,8 @@ class ModmailBot(commands.Bot):
             logger.info("MODMAIL")
         logger.info("v%s", __version__)
         logger.info("Authors: kyb3r, fourjr, Taaku18")
+        logger.line()
+        logger.info("discord.py: v%s", discord.__version__)
         logger.line()
 
         for cog in self.loaded_cogs:
@@ -251,6 +254,36 @@ class ModmailBot(commands.Bot):
             self.prefix,
         )
         return None
+
+    @property
+    def mention_channel(self):
+        channel_id = self.config["mention_channel_id"]
+        if channel_id is not None:
+            try:
+                channel = self.get_channel(int(channel_id))
+                if channel is not None:
+                    return channel
+            except ValueError:
+                pass
+            logger.debug("MENTION_CHANNEL_ID was invalid, removed.")
+            self.config.remove("mention_channel_id")
+
+        return self.log_channel
+
+    @property
+    def update_channel(self):
+        channel_id = self.config["update_channel_id"]
+        if channel_id is not None:
+            try:
+                channel = self.get_channel(int(channel_id))
+                if channel is not None:
+                    return channel
+            except ValueError:
+                pass
+            logger.debug("UPDATE_CHANNEL_ID was invalid, removed.")
+            self.config.remove("update_channel_id")
+
+        return self.log_channel
 
     async def wait_for_connected(self) -> None:
         await self.wait_until_ready()
@@ -526,7 +559,7 @@ class ModmailBot(commands.Bot):
         ]
         if any(other_guilds):
             logger.warning(
-                "The bot is in more servers other than the main and staff server."
+                "The bot is in more servers other than the main and staff server. "
                 "This may cause data compromise (%s).",
                 ", ".join(guild.name for guild in other_guilds),
             )
@@ -616,32 +649,33 @@ class ModmailBot(commands.Bot):
         return True
 
     def check_manual_blocked_roles(self, author: discord.Member) -> bool:
-        for r in author.roles:
-            if str(r.id) in self.blocked_roles:
+        if isinstance(author, discord.Member):
+            for r in author.roles:
+                if str(r.id) in self.blocked_roles:
 
-                blocked_reason = self.blocked_roles.get(str(r.id)) or ""
-                now = datetime.utcnow()
+                    blocked_reason = self.blocked_roles.get(str(r.id)) or ""
+                    now = datetime.utcnow()
 
-                # etc "blah blah blah... until 2019-10-14T21:12:45.559948."
-                end_time = re.search(r"until ([^`]+?)\.$", blocked_reason)
-                if end_time is None:
-                    # backwards compat
-                    end_time = re.search(r"%([^%]+?)%", blocked_reason)
+                    # etc "blah blah blah... until 2019-10-14T21:12:45.559948."
+                    end_time = re.search(r"until ([^`]+?)\.$", blocked_reason)
+                    if end_time is None:
+                        # backwards compat
+                        end_time = re.search(r"%([^%]+?)%", blocked_reason)
+                        if end_time is not None:
+                            logger.warning(
+                                r"Deprecated time message for user %s, block and unblock again to update.",
+                                author.name,
+                            )
+
                     if end_time is not None:
-                        logger.warning(
-                            r"Deprecated time message for user %s, block and unblock again to update.",
-                            author.name,
-                        )
-
-                if end_time is not None:
-                    after = (datetime.fromisoformat(end_time.group(1)) - now).total_seconds()
-                    if after <= 0:
-                        # No longer blocked
-                        self.blocked_users.pop(str(author.id))
-                        logger.debug("No longer blocked, user %s.", author.name)
-                        return True
-                logger.debug("User blocked, user %s.", author.name)
-                return False
+                        after = (datetime.fromisoformat(end_time.group(1)) - now).total_seconds()
+                        if after <= 0:
+                            # No longer blocked
+                            self.blocked_users.pop(str(author.id))
+                            logger.debug("No longer blocked, user %s.", author.name)
+                            return True
+                    logger.debug("User blocked, user %s.", author.name)
+                    return False
 
         return True
 
@@ -695,8 +729,16 @@ class ModmailBot(commands.Bot):
 
         member = self.guild.get_member(author.id)
         if member is None:
-            logger.debug("User not in guild, %s.", author.id)
-        else:
+            # try to find in other guilds
+            for g in self.guilds:
+                member = g.get_member(author.id)
+                if member:
+                    break
+
+            if member is None:
+                logger.debug("User not in guild, %s.", author.id)
+
+        if member is not None:
             author = member
 
         if str(author.id) in self.blocked_whitelisted_users:
@@ -967,11 +1009,14 @@ class ModmailBot(commands.Bot):
     async def update_perms(
         self, name: typing.Union[PermissionLevel, str], value: int, add: bool = True
     ) -> None:
-        value = str(value)
+        if value != -1:
+            value = str(value)
         if isinstance(name, PermissionLevel):
+            level = True
             permissions = self.config["level_permissions"]
             name = name.name
         else:
+            level = False
             permissions = self.config["command_permissions"]
         if name not in permissions:
             if add:
@@ -983,6 +1028,11 @@ class ModmailBot(commands.Bot):
             else:
                 if value in permissions[name]:
                     permissions[name].remove(value)
+
+        if level:
+            self.config["level_permissions"] = permissions
+        else:
+            self.config["command_permissions"] = permissions
         logger.info("Updating permissions for %s, %s (add=%s).", name, value, add)
         await self.config.update()
 
@@ -1000,9 +1050,10 @@ class ModmailBot(commands.Bot):
                 title="Bot mention",
                 description=f"[Jump URL]({message.jump_url})\n{truncate(message.content, 50)}",
                 color=self.main_color,
-                timestamp=datetime.utcnow(),
             )
-            await self.log_channel.send(content=self.config["mention"], embed=em)
+            if self.config["show_timestamp"]:
+                em.timestamp = datetime.utcnow()
+            await self.mention_channel.send(content=self.config["mention"], embed=em)
 
         await self.process_commands(message)
 
@@ -1140,19 +1191,19 @@ class ModmailBot(commands.Bot):
                 logger.warning("Failed to find linked message for reactions: %s", e)
                 return
 
-        if payload.event_type == "REACTION_ADD":
-            if await self.add_reaction(linked_message, reaction):
-                await self.add_reaction(message, reaction)
-        else:
-            try:
-                await linked_message.remove_reaction(reaction, self.user)
-                await message.remove_reaction(reaction, self.user)
-            except (discord.HTTPException, discord.InvalidArgument) as e:
-                logger.warning("Failed to remove reaction: %s", e)
+        if self.config["transfer_reactions"] and linked_message is not None:
+            if payload.event_type == "REACTION_ADD":
+                if await self.add_reaction(linked_message, reaction):
+                    await self.add_reaction(message, reaction)
+            else:
+                try:
+                    await linked_message.remove_reaction(reaction, self.user)
+                    await message.remove_reaction(reaction, self.user)
+                except (discord.HTTPException, discord.InvalidArgument) as e:
+                    logger.warning("Failed to remove reaction: %s", e)
 
     async def on_raw_reaction_add(self, payload):
-        if self.config["transfer_reactions"]:
-            await self.handle_reaction_events(payload)
+        await self.handle_reaction_events(payload)
 
         react_message_id = tryint(self.config.get("react_to_contact_message"))
         react_message_emoji = self.config.get("react_to_contact_emoji")
@@ -1166,14 +1217,17 @@ class ModmailBot(commands.Bot):
                 if emoji_fmt == react_message_emoji:
                     channel = self.get_channel(payload.channel_id)
                     member = channel.guild.get_member(payload.user_id)
-                    message = await channel.fetch_message(payload.message_id)
-                    await message.remove_reaction(payload.emoji, member)
+                    if not member.bot:
+                        message = await channel.fetch_message(payload.message_id)
+                        await message.remove_reaction(payload.emoji, member)
 
-                    ctx = await self.get_context(message)
-                    ctx.author = member
-                    await ctx.invoke(
-                        self.get_command("contact"), user=member, manual_trigger=False
-                    )
+                        ctx = await self.get_context(message)
+                        ctx.author = member
+                        await ctx.invoke(
+                            self.get_command("contact"), user=member, manual_trigger=False
+                        )
+
+                        await message.add_reaction(emoji_fmt)  # bot adds as well
 
     async def on_raw_reaction_remove(self, payload):
         if self.config["transfer_reactions"]:
@@ -1332,14 +1386,7 @@ class ModmailBot(commands.Bot):
         logger.error("Unexpected exception:", exc_info=sys.exc_info())
 
     async def on_command_error(self, context, exception):
-        if isinstance(exception, commands.BadUnionArgument):
-            msg = "Could not find the specified " + human_join(
-                [c.__name__ for c in exception.converters]
-            )
-            await context.trigger_typing()
-            await context.send(embed=discord.Embed(color=self.error_color, description=msg))
-
-        elif isinstance(exception, commands.BadArgument):
+        if isinstance(exception, commands.BadArgument):
             await context.trigger_typing()
             await context.send(
                 embed=discord.Embed(color=self.error_color, description=str(exception))
@@ -1457,14 +1504,27 @@ class ModmailBot(commands.Bot):
                     channel = self.log_channel
                     await channel.send(embed=embed)
             else:
+                try:
+                    # update fork if gh_token exists
+                    await self.api.update_repository()
+                except InvalidConfigError:
+                    pass
+
                 command = "git pull"
                 proc = await asyncio.create_subprocess_shell(command, stderr=PIPE, stdout=PIPE,)
+                err = await proc.stderr.read()
+                err = err.decode("utf-8").rstrip()
                 res = await proc.stdout.read()
                 res = res.decode("utf-8").rstrip()
 
-                if res != "Already up to date.":
+                if err and not res:
+                    logger.warning(f"Autoupdate failed: {err}")
+                    self.autoupdate_loop.cancel()
+                    return
+
+                elif res != "Already up to date.":
                     logger.info("Bot has been updated.")
-                    channel = self.log_channel
+                    channel = self.update_channel
                     if self.hosting_method == HostingMethod.PM2:
                         embed = discord.Embed(title="Bot has been updated", color=self.main_color)
                         await channel.send(embed=embed)
@@ -1475,7 +1535,7 @@ class ModmailBot(commands.Bot):
                             color=self.main_color,
                         )
                         await channel.send(embed=embed)
-                        await self.logout()
+                    await self.logout()
 
     async def before_autoupdate(self):
         await self.wait_for_connected()
@@ -1500,6 +1560,14 @@ def main():
         uvloop.install()
     except ImportError:
         pass
+
+    # check discord version
+    if discord.__version__ != "1.5.2":
+        logger.error(
+            "Dependencies are not updated, run pipenv install. discord.py version expected 1.5.2, recieved %s",
+            discord.__version__,
+        )
+        sys.exit(0)
 
     bot = ModmailBot()
     bot.run()
